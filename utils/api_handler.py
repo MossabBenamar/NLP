@@ -12,7 +12,7 @@ class APIHandler:
             error_classifier: An instance of the ErrorClassifier class.
             context_analyzer: An instance of the ContextAnalyzer class.
             solution_generator: An instance of the SolutionGenerator class.
-            ml_model: An instance of the CodeBERTModel class (which uses DialoGPT internally) (optional).
+            ml_model: An instance of the CodeBERTModel class (which uses Google Gemini-2.0-flash internally) (optional).
         """
         self.preprocessor = preprocessor
         self.error_classifier = error_classifier
@@ -97,6 +97,7 @@ class APIHandler:
                     ml_solution = self.ml_model.generate_fix(
                         preprocessed_data.get('normalized_code', ''),
                         error_type,
+                        preprocessed_data.get('error_message', ''),
                         preprocessed_data.get('line_number')
                     )
                     if ml_solution:

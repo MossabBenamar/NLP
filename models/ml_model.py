@@ -1,23 +1,25 @@
-import torch
-from transformers import AutoTokenizer, T5ForConditionalGeneration, AutoModelForCausalLM
-import numpy as np
-import re
 import os
+import re
+import asyncio
 import threading
 import time
+import google.generativeai as genai
+from dotenv import load_dotenv
+from typing import Tuple, Optional
+import concurrent.futures
+import sys
+
+# Load environment variables
+load_dotenv()
 
 class CodeBERTModel:
-    """A lightweight and efficient code error fixing model with rule-based classification and optimized generation."""
+    """A code error fixing model using Google's Gemini-2.0-flash model."""
     
     def __init__(self):
-        """Initialize the model with lazy loading and optimized settings."""
-        # Use a smaller, faster model for better performance
-        self.generation_model_name = "microsoft/DialoGPT-small"  # Smaller, faster alternative
-        self.generation_tokenizer = None
-        self.generation_model = None
-        
-        # Set cache directory to avoid permission issues
-        self.cache_dir = os.path.join(os.getcwd(), "model_cache")
+        """Initialize the model with Gemini-2.0-flash."""
+        # Gemini model configuration
+        self.model_name = "gemini-2.0-flash-exp"
+        self.client = None
         
         # Lazy loading flag
         self._model_loaded = False
@@ -100,48 +102,60 @@ class CodeBERTModel:
         
         # Don't initialize models on creation - use lazy loading
         self.is_initialized = False
+        self._thread_local = threading.local()
+
     
     def _ensure_model_loaded(self):
-        """Ensure the model is loaded using lazy loading with thread safety."""
+        """Ensure the Gemini model is loaded using lazy loading with thread safety."""
         if self._model_loaded:
             return True
-            
+        
         with self._loading_lock:
-            if self._model_loaded:  # Double-check after acquiring lock
+            if self._model_loaded:
                 return True
                 
             try:
-                print("Loading lightweight model for code generation...")
-                # Create cache directory if it doesn't exist
-                os.makedirs(self.cache_dir, exist_ok=True)
+                sys.stderr.write("\n*** Loading Gemini model... ***\n")
+                sys.stderr.flush()
                 
-                # Load a smaller, faster tokenizer and model
-                self.generation_tokenizer = AutoTokenizer.from_pretrained(
-                    self.generation_model_name,
-                    cache_dir=self.cache_dir,
-                    padding_side='left'
-                )
+                api_key = os.getenv("GOOGLE_API_KEY")
+                if not api_key:
+                    raise ValueError("GOOGLE_API_KEY not set in .env file")
                 
-                # Set padding token
-                if self.generation_tokenizer.pad_token is None:
-                    self.generation_tokenizer.pad_token = self.generation_tokenizer.eos_token
+                # CORRECTED INITIALIZATION
+                genai.configure(api_key=api_key)
+                # Initialize Gemini client PER-THREAD
+                if not hasattr(self._thread_local, 'client'):
+                    self._thread_local.client = genai.GenerativeModel(self.model_name)
                 
-                # Load a smaller causal language model
-                self.generation_model = AutoModelForCausalLM.from_pretrained(
-                    self.generation_model_name,
-                    cache_dir=self.cache_dir,
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                    device_map="auto" if torch.cuda.is_available() else None
-                )
+                self.client = self._thread_local.client  # Set instance reference
                 
-                self.generation_model.eval()
+                # Test connection
+                try:
+                    response = self.client.generate_content(
+                        "Hello",
+                        generation_config=genai.types.GenerationConfig(
+                            temperature=0.3,
+                            top_p=0.8,
+                            max_output_tokens=10
+                        )
+                    )
+                    if response.text:
+                        sys.stderr.write("\n*** Gemini connection test successful ***\n")
+                except Exception as e:
+                    sys.stderr.write(f"\n*** Gemini test failed: {e} ***\n")
+                
                 self._model_loaded = True
                 self.is_initialized = True
-                print("Model loaded successfully")
+                sys.stderr.write("\n*** Gemini model loaded successfully ***\n")
                 return True
                 
             except Exception as e:
-                print(f"Error loading model: {e}")
+                sys.stderr.write(f"\n*** Error loading Gemini model: {e} ***\n")
+                sys.stderr.write("\nPlease ensure you have:\n")
+                sys.stderr.write("1. Set GOOGLE_API_KEY in your .env file\n")
+                sys.stderr.write("2. Installed google-genai package: pip install google-genai\n")
+                sys.stderr.flush()
                 self._model_loaded = False
                 self.is_initialized = False
                 return False
@@ -310,100 +324,30 @@ class CodeBERTModel:
         
         return '\n'.join(fixed_lines)
     
-    def _get_rule_based_fix(self, code, error_type, error_message):
-        """Generate a rule-based fix for common errors.
-        
-        Args:
-            code: The original code.
-            error_type: The classified error type.
-            error_message: The error message.
-            
-        Returns:
-            A suggested fix string or None if no rule-based fix available.
-        """
+    def _run_async_fix(self, code, error_type, error_message, error_line=None):
+        """Run the async fix generation in a clean event loop."""
+        import asyncio
+
         try:
-            if error_type == 'syntax_error':
-                return self._fix_syntax_error(code, error_message)
-            elif error_type == 'indentation_error':
-                return self._fix_indentation_error(code)
-            elif error_type == 'name_error':
-                return self._fix_name_error(code, error_message)
-            elif error_type == 'type_error':
-                return self._fix_type_error(code, error_message)
-        except Exception as e:
-            print(f"Error in rule-based fix: {e}")
-            
-        return None
-    
-    def _fix_syntax_error(self, code, error_message):
-        """Fix common syntax errors."""
-        lines = code.split('\n')
-        fixed_lines = []
-        
-        for line in lines:
-            fixed_line = line
-            
-            # Fix missing colons
-            if re.search(r'(if|elif|else|for|while|def|class|try|except|finally|with)\s+[^:]*$', line.strip()):
-                if not line.strip().endswith(':'):
-                    fixed_line = line.rstrip() + ':'
-            
-            # Fix print statements (Python 2 to 3)
-            if re.search(r'print\s+[^\(]', line):
-                fixed_line = re.sub(r'print\s+([^\(].*)', r'print(\1)', line)
-            
-            fixed_lines.append(fixed_line)
-        
-        return '\n'.join(fixed_lines)
-    
-    def _fix_indentation_error(self, code):
-        """Fix indentation errors by standardizing to 4 spaces."""
-        lines = code.split('\n')
-        fixed_lines = []
-        
-        for line in lines:
-            if line.strip():  # Non-empty line
-                # Count leading spaces
-                leading_spaces = len(line) - len(line.lstrip())
-                # Standardize to multiples of 4
-                indent_level = leading_spaces // 4
-                fixed_line = '    ' * indent_level + line.lstrip()
-                fixed_lines.append(fixed_line)
-            else:
-                fixed_lines.append(line)
-        
-        return '\n'.join(fixed_lines)
-    
-    def _fix_name_error(self, code, error_message):
-        """Fix common name errors and typos."""
-        fixed_code = code
-        
-        # Fix common typos
-        typos = self.fix_patterns['name_error']['common_typos']
-        for typo, correction in typos.items():
-            fixed_code = re.sub(r'\b' + typo + r'\b', correction, fixed_code)
-        
-        return fixed_code
-    
-    def _fix_type_error(self, code, error_message):
-        """Fix common type errors."""
-        lines = code.split('\n')
-        fixed_lines = []
-        
-        for line in lines:
-            fixed_line = line
-            
-            # Fix string concatenation with numbers
-            if 'can\'t convert' in error_message.lower() or 'unsupported operand' in error_message.lower():
-                # Add str() around variables that might need conversion
-                fixed_line = re.sub(r'(\w+)\s*\+\s*(\w+)', r'str(\1) + str(\2)', line)
-            
-            fixed_lines.append(fixed_line)
-        
-        return '\n'.join(fixed_lines)
-    
-    def generate_fix(self, code, error_type, error_message, error_line=None):
-        """Generate a fix for the given code error using CodeT5+.
+            # Try to get the current running loop
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            # If no loop exists, create a new one
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        try:
+            # Run the async function
+            return loop.run_until_complete(
+                self._generate_fix_async(code, error_type, error_message, error_line)
+            )
+        finally:
+            # Avoid closing the default loop on Windows
+            if hasattr(loop, 'is_closed') and not loop.is_closed():
+                loop.close()
+
+    async def _generate_fix_async(self, code, error_type, error_message, error_line=None):
+        """Generate a fix using Gemini-2.0-flash model asynchronously.
         
         Args:
             code: The code containing the error.
@@ -414,92 +358,188 @@ class CodeBERTModel:
         Returns:
             A string containing the fixed code, or the original code if fix generation fails.
         """
+        
         if not self.is_initialized:
-            print("CodeT5+ model not initialized. Cannot generate fix.")
+            sys.stderr.write("\n*** Gemini model not initialized. Cannot generate fix. ***\n")
+            sys.stderr.flush()
             return code
         
         try:
-            # Create a comprehensive prompt for the model
-            prompt = self._create_fix_prompt(code, error_type, error_message, error_line)
-            print(f"Generated prompt for CodeT5+: {prompt[:200]}...")  # Show first 200 chars
+            # Special handling for problematic error types
+            problematic_types = ['syntax_error', 'type_error', 'name_error', 'reference_error']
+            is_problematic = error_type.lower() in problematic_types
             
-            # Tokenize the prompt with proper attention mask
-            inputs = self.generation_tokenizer(
-                prompt,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_attention_mask=True
+            if is_problematic:
+                sys.stderr.write(f"\n*** Using enhanced prompt for {error_type} ***\n")
+                sys.stderr.flush()
+                
+                # Create an enhanced prompt for problematic error types
+                prompt = self._create_enhanced_prompt(code, error_type, error_message, error_line)
+            else:
+                # Create a standard prompt for other error types
+                prompt = self._create_gemini_prompt(code, error_type, error_message, error_line)
+            
+            sys.stderr.write(f"\n*** Generated prompt for Gemini: {prompt[:200]}... ***\n")
+            sys.stderr.flush()
+            
+            # Configure Gemini model
+            config = genai.types.GenerationConfig(
+                temperature=0.2,  # Lower temperature for more deterministic code fixes
+                top_p=0.8,
+                max_output_tokens=1000
             )
             
-            # Generate fix with optimized parameters for code generation
-            with torch.no_grad():
-                outputs = self.generation_model.generate(
-                    input_ids=inputs['input_ids'],
-                    attention_mask=inputs['attention_mask'],
-                    max_new_tokens=200,  # Reasonable limit for code fixes
-                    num_beams=4,         # Beam search for quality
-                    temperature=0.8,     # Balanced creativity
-                    do_sample=True,      # Enable sampling
-                    top_p=0.95,         # Nucleus sampling
-                    top_k=50,           # Top-k sampling
-                    pad_token_id=self.generation_tokenizer.pad_token_id,
-                    eos_token_id=self.generation_tokenizer.eos_token_id,
-                    early_stopping=True,
-                    no_repeat_ngram_size=3,  # Avoid repetition
-                    repetition_penalty=1.1   # Slight penalty for repetition
-                )
+            # Generate content with Gemini (synchronously)
+            sys.stderr.write("\n*** Calling Gemini API synchronously... ***\n")
+            sys.stderr.flush()
             
-            # Decode the generated output
-            generated_text = self.generation_tokenizer.decode(
-                outputs[0], 
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=True
-            )
-            
-            print(f"Raw generated text: {generated_text[:300]}...")  # Debug output
-            
-            # Extract the fixed code from the generated text
-            fixed_code = self._extract_fix(generated_text, code)
-            
-            # Validate the fix
-            if fixed_code.strip() == code.strip():
-                print("Generated fix is identical to original. Trying alternative approach...")
-                # Try with a simpler, more direct prompt
-                simple_prompt = f"Fix this {error_type}: {code}"
-                simple_inputs = self.generation_tokenizer(
-                    simple_prompt,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=256
+            try:
+                # Get thread-local client
+                client = self._thread_local.client
+                
+                # Generate content synchronously
+                response = client.generate_content(
+                    prompt,
+                    generation_config=config
                 )
                 
-                outputs = self.generation_model.generate(
-                    **simple_inputs,
-                    max_new_tokens=150,
-                    temperature=0.9,
-                    do_sample=True,
-                    top_p=0.9,
-                    pad_token_id=self.generation_tokenizer.pad_token_id,
-                    eos_token_id=self.generation_tokenizer.eos_token_id
-                )
+                # Extract the response text
+                if response.candidates:
+                    response_text = response.candidates[0].content.parts[0].text
+                else:
+                    response_text = ""
                 
-                generated_text = self.generation_tokenizer.decode(outputs[0], skip_special_tokens=True)
-                fixed_code = self._extract_fix(generated_text, code)
-            
-            print(f"Final fixed code: {fixed_code[:200]}...")  # Debug output
-            return fixed_code
+                sys.stderr.write(f"\n*** Raw Gemini response: {response_text[:300]}... ***\n")
+                sys.stderr.flush()
+                
+                # Extract the fixed code from the response
+                fixed_code = self._extract_gemini_fix(response_text, code)
+                
+                # Validate the fixed code
+                if not fixed_code or len(fixed_code.strip()) < 10:
+                    sys.stderr.write("\n*** Warning: Extracted fix is too short or empty. Using original code. ***\n")
+                    sys.stderr.flush()
+                    return code
+                
+                # Additional validation for problematic error types
+                if is_problematic:
+                    # Ensure the fix actually addresses the error
+                    if error_type.lower() == 'syntax_error' and ':' not in fixed_code and ':' in error_message:
+                        sys.stderr.write("\n*** Warning: Fix doesn't address missing colon syntax error. Trying again... ***\n")
+                        sys.stderr.flush()
+                        # Fall through to retry
+                    elif error_type.lower() == 'name_error' and error_message and any(name in error_message.lower() for name in ['not defined', 'undefined']):
+                        # Check if the undefined variable is now defined in the fixed code
+                        undefined_var = re.search(r"'([^']+)'\s+is not defined", error_message)
+                        if undefined_var and undefined_var.group(1) not in fixed_code:
+                            sys.stderr.write(f"\n*** Warning: Fix doesn't address undefined variable {undefined_var.group(1)}. Trying again... ***\n")
+                            sys.stderr.flush()
+                            # Fall through to retry
+                        else:
+                            sys.stderr.write(f"\n*** Final fixed code: {fixed_code[:200]}... ***\n")
+                            sys.stderr.flush()
+                            return fixed_code
+                    else:
+                        sys.stderr.write(f"\n*** Final fixed code: {fixed_code[:200]}... ***\n")
+                        sys.stderr.flush()
+                        return fixed_code
+                else:
+                    sys.stderr.write(f"\n*** Final fixed code: {fixed_code[:200]}... ***\n")
+                    sys.stderr.flush()
+                    return fixed_code
+                
+            except Exception as api_error:
+                sys.stderr.write(f"\n*** Error calling Gemini API: {api_error} ***\n")
+                import traceback
+                sys.stderr.write(f"\n{traceback.format_exc()}\n")
+                sys.stderr.flush()
+                
+                # Try one more time with a simpler prompt
+                try:
+                    sys.stderr.write("\n*** Retrying with simpler prompt... ***\n")
+                    sys.stderr.flush()
+                    
+                    # Simplified prompt with more explicit instructions for problematic types
+                    if is_problematic:
+                        simple_prompt = f"You are a Python expert. Fix this {error_type} in the code below. Return ONLY the fixed code with no explanations.\n\nError: {error_message}\n\nCode to fix:\n```python\n{code}\n```\n\nFixed code:"
+                    else:
+                        simple_prompt = f"Fix this {error_type} in the following code:\n\n```\n{code}\n```\n\nError: {error_message}"
+                    
+                    # Try again with simpler prompt
+                    retry_response = client.generate_content(
+                        simple_prompt,
+                        generation_config=config
+                    )
+                    
+                    if retry_response.candidates:
+                        retry_text = retry_response.candidates[0].content.parts[0].text
+                        sys.stderr.write(f"\n*** Retry response: {retry_text[:300]}... ***\n")
+                        sys.stderr.flush()
+                        
+                        # Extract the fixed code from the retry response
+                        fixed_code = self._extract_gemini_fix(retry_text, code)
+                        if fixed_code and len(fixed_code.strip()) >= 10:
+                            return fixed_code
+                except Exception as retry_error:
+                    sys.stderr.write(f"\n*** Retry also failed: {retry_error} ***\n")
+                    sys.stderr.flush()
+                
+                # If we get here, both attempts failed
+                return code
             
         except Exception as e:
-            print(f"Error generating fix with CodeT5+: {e}")
+            sys.stderr.write(f"\n*** Error generating fix with Gemini: {e} ***\n")
             import traceback
-            print(traceback.format_exc())
+            sys.stderr.write(f"\n{traceback.format_exc()}\n")
+            sys.stderr.flush()
             return code
     
-    def _create_fix_prompt(self, code, error_type, error_message=None, error_line=None):
-        """Create a prompt for the CodeT5+ model to generate a fix.
+    def generate_fix(self, code, error_type, error_message, error_line=None):
+        """Generate a fix for the given code error using Gemini-2.0-flash.
+        
+        Args:
+            code: The code containing the error.
+            error_type: The type of error (from classification).
+            error_message: The error message.
+            error_line: The line number where the error occurred (optional).
+            
+        Returns:
+            A string containing the fixed code, or the original code if fix generation fails.
+        """
+
+        # Ensure model is loaded - retry up to 2 times if needed
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            if self._ensure_model_loaded():
+                break
+            if attempt < max_retries:
+                sys.stderr.write(f"\n*** Retry {attempt+1}/{max_retries} loading Gemini model... ***")
+                sys.stderr.flush()
+                time.sleep(1)  # Short delay before retry
+            else:
+                sys.stderr.write("\n*** Failed to load Gemini model after retries. Using rule-based fix as fallback. ***")
+                sys.stderr.flush()
+                return self._get_rule_based_fix(code, error_type, error_message) or code
+
+        try:
+            sys.stderr.write("\n*** Running Gemini fix generation... ***\n")
+            sys.stderr.flush()
+            
+            # Use synchronous generation to avoid event loop conflicts
+            fixed_code = self._generate_fix_async(code, error_type, error_message, error_line)
+            return fixed_code
+
+        except Exception as e:
+            sys.stderr.write(f"\n*** Error in generate_fix: {e} ***\n")
+            import traceback
+            sys.stderr.write(traceback.format_exc() + "\n")
+            sys.stderr.flush()
+
+            # Fall back to rule-based fix
+            return self._get_rule_based_fix(code, error_type, error_message) or code
+    
+    def _create_gemini_prompt(self, code, error_type, error_message=None, error_line=None):
+        """Create a prompt for the Gemini model to generate a fix.
         
         Args:
             code: The code containing the error.
@@ -508,123 +548,215 @@ class CodeBERTModel:
             error_line: The line number of the error (optional).
             
         Returns:
-            A formatted prompt string optimized for CodeT5+.
+            A formatted prompt string optimized for Gemini.
         """
-        # Create a structured prompt optimized for CodeT5+ code generation
-        prompt_parts = []
-        
-        # Start with task instruction
-        prompt_parts.append("Fix the code error:")
+        prompt_parts = [
+            "You are an expert Python code debugger. Your task is to fix the following code error.",
+            "Please provide ONLY the corrected code without any explanations or markdown formatting.",
+            "Do not include any text before or after the code.",
+            ""
+        ]
         
         # Add error details
         if error_type:
-            prompt_parts.append(f"Error: {error_type}")
+            prompt_parts.append(f"Error Type: {error_type}")
         
         if error_message:
-            prompt_parts.append(f"Message: {error_message}")
+            prompt_parts.append(f"Error Message: {error_message}")
         
         if error_line is not None:
-            prompt_parts.append(f"Line: {error_line}")
+            prompt_parts.append(f"Error Line: {error_line}")
         
         # Add the code with clear delimiters
-        prompt_parts.append("\nOriginal code:")
-        prompt_parts.append(code.strip())
+        prompt_parts.extend([
+            "",
+            "Code to fix:",
+            "```python",
+            code.strip(),
+            "```",
+            "",
+            "Fixed code:"
+        ])
         
-        # Clear instruction for output
-        prompt_parts.append("\nFixed code:")
+        return '\n'.join(prompt_parts)
+        
+    def _create_enhanced_prompt(self, code, error_type, error_message=None, error_line=None):
+        """Create an enhanced prompt for problematic error types.
+        
+        Args:
+            code: The code containing the error.
+            error_type: The type of error.
+            error_message: The error message (optional).
+            error_line: The line number of the error (optional).
+            
+        Returns:
+            A formatted prompt string with specific instructions for problematic error types.
+        """
+        # Base instructions for all problematic types
+        prompt_parts = [
+            "You are an expert Python code debugger specializing in fixing common errors.",
+            "Your task is to fix the following code error and return ONLY the corrected code.",
+            "Do not include any explanations, comments, or markdown formatting in your response.",
+            "Do not include any text before or after the code.",
+            ""
+        ]
+        
+        # Add specific instructions based on error type
+        if error_type.lower() == 'syntax_error':
+            prompt_parts.extend([
+                "IMPORTANT INSTRUCTIONS FOR SYNTAX ERRORS:",
+                "1. Look for missing colons after function/class definitions, if/else statements, loops, etc.",
+                "2. Check for mismatched parentheses, brackets, or quotes.",
+                "3. Verify proper indentation throughout the code.",
+                "4. Ensure all strings are properly closed.",
+                "5. Check for missing commas in lists, dictionaries, or function calls."
+            ])
+        elif error_type.lower() == 'type_error':
+            prompt_parts.extend([
+                "IMPORTANT INSTRUCTIONS FOR TYPE ERRORS:",
+                "1. Identify incompatible types being used together (e.g., string + integer).",
+                "2. Add appropriate type conversions (str(), int(), float(), etc.).",
+                "3. Check function arguments match expected parameter types.",
+                "4. Verify dictionary keys and list indices are of correct types.",
+                "5. Ensure objects are being used with appropriate methods."
+            ])
+        elif error_type.lower() == 'name_error':
+            prompt_parts.extend([
+                "IMPORTANT INSTRUCTIONS FOR NAME ERRORS:",
+                "1. Find and fix undefined variables (look for typos or missing definitions).",
+                "2. Check for variables used before assignment.",
+                "3. Verify proper import statements for any modules being used.",
+                "4. Check for scope issues (local vs global variables).",
+                "5. Add missing variable definitions or parameters."
+            ])
+        elif error_type.lower() == 'reference_error':
+            prompt_parts.extend([
+                "IMPORTANT INSTRUCTIONS FOR REFERENCE ERRORS:",
+                "1. Find and fix undefined variables or functions.",
+                "2. Check for proper variable declarations (var, let, const in JavaScript).",
+                "3. Verify proper import/require statements for any modules.",
+                "4. Check for scope issues and hoisting problems.",
+                "5. Add missing variable definitions or function declarations."
+            ])
+        
+        # Add error details
+        prompt_parts.append("")
+        if error_type:
+            prompt_parts.append(f"Error Type: {error_type}")
+        
+        if error_message:
+            prompt_parts.append(f"Error Message: {error_message}")
+            
+            # Extract specific information from error message
+            if error_type.lower() == 'name_error' and 'is not defined' in error_message:
+                var_match = re.search(r"'([^']+)'\s+is not defined", error_message)
+                if var_match:
+                    undefined_var = var_match.group(1)
+                    prompt_parts.append(f"Undefined Variable: {undefined_var}")
+                    prompt_parts.append(f"You MUST define or fix the variable '{undefined_var}' in your solution.")
+            elif error_type.lower() == 'syntax_error' and 'expected' in error_message:
+                prompt_parts.append("You MUST fix the syntax error exactly as described in the error message.")
+        
+        if error_line is not None:
+            prompt_parts.append(f"Error Line: {error_line}")
+        
+        # Add the code with clear delimiters
+        prompt_parts.extend([
+            "",
+            "Code to fix:",
+            "```python",
+            code.strip(),
+            "```",
+            "",
+            "REMEMBER: Return ONLY the fixed code with no explanations or additional text.",
+            "Fixed code:"
+        ])
         
         return '\n'.join(prompt_parts)
     
-    def _extract_fix(self, generated_text, original_code):
-        """Extract the fixed code from the model's generated text.
+    def _extract_gemini_fix(self, response_text, original_code):
+        """Extract the fixed code from Gemini's response.
         
         Args:
-            generated_text: The text generated by the model.
+            response_text: The text generated by Gemini.
             original_code: The original code for fallback.
             
         Returns:
             The extracted fixed code as a string.
         """
         try:
-            # Clean the generated text
-            fix_text = generated_text.strip()
+            import sys
+            sys.stderr.write(f"\n*** Extracting fix from response: {response_text[:100]}... ***\n")
+            sys.stderr.flush()
             
-            # Strategy 1: Look for "Fixed code:" marker and extract what follows
-            if "Fixed code:" in fix_text:
-                fix_text = fix_text.split("Fixed code:", 1)[1].strip()
-            elif "fixed code:" in fix_text.lower():
-                # Case insensitive search
-                lower_text = fix_text.lower()
-                marker_pos = lower_text.find("fixed code:")
-                if marker_pos != -1:
-                    fix_text = fix_text[marker_pos + len("fixed code:"):].strip()
+            # Clean the response text
+            fix_text = response_text.strip()
             
-            # Strategy 2: Handle code blocks
-            if "```" in fix_text:
-                # Extract content between code blocks
-                parts = fix_text.split("```")
-                if len(parts) >= 3:
-                    # Take the content of the first code block
-                    code_block = parts[1]
-                    # Remove language identifier if present
-                    lines = code_block.split('\n')
-                    if lines and lines[0].strip().lower() in ['python', 'py', 'code']:
-                        lines = lines[1:]
-                    fix_text = '\n'.join(lines).strip()
+            # Remove common prefixes that Gemini might add
+            prefixes_to_remove = [
+                "Here's the fixed code:",
+                "Here is the fixed code:",
+                "Fixed code:",
+                "The fixed code is:",
+                "Fixed Python code:",
+                "Corrected code:",
+                "Here's the corrected code:",
+                "Here is the corrected code:",
+                "The corrected code is:",
+                "Here's the corrected code:"
+            ]
             
-            # Strategy 3: Remove line numbers if present
-            lines = fix_text.split('\n')
-            cleaned_lines = []
-            import re
-            for line in lines:
-                # Remove line numbers at the beginning (e.g., "1: ", "2: ")
-                cleaned_line = re.sub(r'^\s*\d+:\s*', '', line)
-                cleaned_lines.append(cleaned_line)
+            for prefix in prefixes_to_remove:
+                if fix_text.lower().startswith(prefix.lower()):
+                    fix_text = fix_text[len(prefix):].strip()
+                    break
             
-            fix_text = '\n'.join(cleaned_lines)
+            # Handle code blocks (extract content between triple backticks)
+            code_block_pattern = r'```(?:python)?\s*\n(.+?)\n```'
+            code_blocks = re.findall(code_block_pattern, fix_text, re.DOTALL)
             
-            # Strategy 4: Remove explanatory text and keep only code
-            lines = fix_text.split('\n')
-            code_lines = []
+            if code_blocks:
+                # Use the first code block found
+                fix_text = code_blocks[0].strip()
+                sys.stderr.write(f"\n*** Extracted code block: {fix_text[:100]}... ***\n")
+                sys.stderr.flush()
+            else:
+                # If no code blocks, try to remove markdown and other formatting
+                fix_text = re.sub(r'^```python\s*|```$', '', fix_text)
+                fix_text = re.sub(r'^```|```$', '', fix_text)
+                sys.stderr.write(f"\n*** No code blocks found, cleaned text: {fix_text[:100]}... ***\n")
+                sys.stderr.flush()
+                
+                # Try alternative extraction methods for problematic cases
+                # Look for code after 'Fixed code:' or similar markers
+                markers = ['fixed code:', 'corrected code:']
+                for marker in markers:
+                    if marker in fix_text.lower():
+                        parts = fix_text.lower().split(marker, 1)
+                        if len(parts) > 1 and parts[1].strip():
+                            fix_text = parts[1].strip()
+                            sys.stderr.write(f"\n*** Extracted after marker '{marker}': {fix_text[:100]}... ***\n")
+                            sys.stderr.flush()
+                            break
             
-            for line in lines:
-                stripped = line.strip()
-                # Skip empty lines and explanatory text
-                if not stripped:
-                    code_lines.append(line)  # Keep empty lines for code structure
-                elif stripped.startswith(('#', '//', '/*', '*')):
-                    code_lines.append(line)  # Keep comments
-                elif any(keyword in stripped for keyword in [
-                    'def ', 'class ', 'import ', 'from ', 'if ', 'elif ', 'else:', 
-                    'for ', 'while ', 'try:', 'except', 'finally:', 'with ', 
-                    'return', 'yield', 'break', 'continue', 'pass', 'raise',
-                    '=', '+=', '-=', '*=', '/=', '(', ')', '[', ']', '{', '}'
-                ]):
-                    code_lines.append(line)  # Keep code lines
-                elif not any(phrase in stripped.lower() for phrase in [
-                    'here is', 'this is', 'the fix', 'explanation', 'note that',
-                    'to fix', 'the error', 'corrected', 'fixed', 'solution'
-                ]):
-                    code_lines.append(line)  # Keep if not explanatory
-            
-            if code_lines:
-                fix_text = '\n'.join(code_lines)
-            
-            # Final cleanup
-            fix_text = fix_text.strip()
-            
-            # Remove any remaining markdown
-            fix_text = re.sub(r'```\w*\n?', '', fix_text)
-            fix_text = fix_text.replace('```', '').strip()
-            
-            # If the result is empty or too short, return original code
-            if not fix_text or len(fix_text.strip()) < 5:
-                print("Extracted fix is too short, returning original code")
+            # If the extracted fix is empty or too short, return the original code
+            if not fix_text or len(fix_text) < 5:  # Arbitrary minimum length
+                sys.stderr.write("\n*** Extracted fix is too short, returning original code ***\n")
+                sys.stderr.flush()
                 return original_code
             
+            # Verify the fix has actual code content, not just explanations
+            code_indicators = ['def ', 'class ', 'import ', 'print(', 'if ', 'for ', 'while ', '=', 'return ']
+            has_code = any(indicator in fix_text for indicator in code_indicators)
+            
+            if not has_code:
+                sys.stderr.write("\n*** Extracted text doesn't appear to contain code, returning original code ***\n")
+                sys.stderr.flush()
+                return original_code
+                
             return fix_text
             
         except Exception as e:
-            print(f"Error extracting fix: {e}")
+            print(f"Error extracting Gemini fix: {e}")
             # Return the original code if extraction fails
             return original_code

@@ -18,9 +18,13 @@ This project implements an NLP-based system that analyzes code errors, understan
 
 ## Technologies Used
 
-- **NLP Techniques**: Text classification, named entity recognition (NER), and sequence-to-sequence models for generating fixes.
-- **Machine Learning Models**: Pre-trained models such as GPT-3, Codex, or DialoGPT for understanding and generating code solutions.
-- **Error Log Analysis**: Custom rules and machine learning for analyzing specific programming language error logs.
+- **Python**: Core programming language
+- **Flask**: Web framework for the API
+- **Google Gemini-2.0-flash**: For advanced code generation and error fixing
+- **NLTK**: Natural language processing
+- **scikit-learn**: Machine learning utilities
+- **spaCy**: Advanced NLP processing
+- **Pygments**: Code syntax highlighting and parsing
 
 ## Project Structure
 
@@ -34,7 +38,7 @@ This project implements an NLP-based system that analyzes code errors, understan
 │   ├── error_classifier.py  # Error classification model
 │   ├── context_analyzer.py  # Context analysis model
 │   ├── solution_gen.py      # Solution generation model
-│   └── ml_model.py          # Machine learning model (DialoGPT)
+│   └── ml_model.py          # Machine learning model (Gemini-2.0-flash)
 ├── utils/                # Utility functions
 │   ├── preprocessor.py   # Code and error preprocessing
 │   └── api_handler.py    # API request/response handling
@@ -62,6 +66,14 @@ This project implements an NLP-based system that analyzes code errors, understan
 3. Install the dependencies:
    ```
    pip install -r requirements.txt
+   ```
+
+4. Set up environment variables:
+   - Copy `.env.example` to `.env`
+   - Get your Google API key from [Google AI Studio](https://aistudio.google.com/app/apikey)
+   - Add your API key to the `.env` file:
+   ```
+   GOOGLE_API_KEY=your_actual_api_key_here
    ```
 
 ## Usage
