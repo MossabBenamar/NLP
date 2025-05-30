@@ -3,7 +3,7 @@ import re
 import asyncio
 import threading
 import time
-import google.generativeai as genai
+from groq import Groq
 from dotenv import load_dotenv
 from typing import Tuple, Optional
 import concurrent.futures
@@ -18,8 +18,8 @@ class CodeBERTModel:
     def __init__(self):
         """Initialize the model with Gemini-2.0-flash."""
         # Gemini model configuration
-        self.model_name = "gemini-2.0-flash-exp"
-        self.client = None
+        self.model_name = "llama-3.3-70b-versatile"
+        self.client = Groq(api_key=os.getenv("GROQ_API_KEY"))
         
         # Lazy loading flag
         self._model_loaded = False
@@ -118,29 +118,30 @@ class CodeBERTModel:
                 sys.stderr.write("\n*** Loading Gemini model... ***\n")
                 sys.stderr.flush()
                 
-                api_key = os.getenv("GOOGLE_API_KEY")
+                api_key = os.getenv("GROQ_API_KEY")
                 if not api_key:
-                    raise ValueError("GOOGLE_API_KEY not set in .env file")
+                    raise ValueError("GROQ_API_KEY not set in .env file")
                 
                 # CORRECTED INITIALIZATION
-                genai.configure(api_key=api_key)
+                Groq.configure(api_key=api_key)
                 # Initialize Gemini client PER-THREAD
                 if not hasattr(self._thread_local, 'client'):
-                    self._thread_local.client = genai.GenerativeModel(self.model_name)
+                    self._thread_local.client = Groq(api_key=api_key)
                 
                 self.client = self._thread_local.client  # Set instance reference
                 
                 # Test connection
                 try:
-                    response = self.client.generate_content(
-                        "Hello",
-                        generation_config=genai.types.GenerationConfig(
-                            temperature=0.3,
-                            top_p=0.8,
-                            max_output_tokens=10
-                        )
+                    response = self.client.chat.completions.create(
+                        model=self.model_name,
+                        messages=[
+                            {"role": "system", "content": "You are an expert Python code debugger."},
+                            {"role": "user", "content": "Hello"}
+                        ],
+                        temperature=0.3,
+                        max_tokens=10
                     )
-                    if response.text:
+                    if response.choices[0].message.content:
                         sys.stderr.write("\n*** Gemini connection test successful ***\n")
                 except Exception as e:
                     sys.stderr.write(f"\n*** Gemini test failed: {e} ***\n")
@@ -154,7 +155,7 @@ class CodeBERTModel:
                 sys.stderr.write(f"\n*** Error loading Gemini model: {e} ***\n")
                 sys.stderr.write("\nPlease ensure you have:\n")
                 sys.stderr.write("1. Set GOOGLE_API_KEY in your .env file\n")
-                sys.stderr.write("2. Installed google-genai package: pip install google-genai\n")
+                sys.stderr.write("2. Installed groq package: pip install groq\n")
                 sys.stderr.flush()
                 self._model_loaded = False
                 self.is_initialized = False
@@ -383,7 +384,7 @@ class CodeBERTModel:
             sys.stderr.flush()
             
             # Configure Gemini model
-            config = genai.types.GenerationConfig(
+            config = Groq.types.GenerationConfig(
                 temperature=0.2,  # Lower temperature for more deterministic code fixes
                 top_p=0.8,
                 max_output_tokens=1000
@@ -398,16 +399,19 @@ class CodeBERTModel:
                 client = self._thread_local.client
                 
                 # Generate content synchronously
-                response = client.generate_content(
-                    prompt,
-                    generation_config=config
+                response = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": "You are an expert Python code debugger."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.2,
+                    max_tokens=1000,
+                    top_p=0.8
                 )
                 
                 # Extract the response text
-                if response.candidates:
-                    response_text = response.candidates[0].content.parts[0].text
-                else:
-                    response_text = ""
+                response_text = response.choices[0].message.content
                 
                 sys.stderr.write(f"\n*** Raw Gemini response: {response_text[:300]}... ***\n")
                 sys.stderr.flush()
@@ -466,13 +470,19 @@ class CodeBERTModel:
                         simple_prompt = f"Fix this {error_type} in the following code:\n\n```\n{code}\n```\n\nError: {error_message}"
                     
                     # Try again with simpler prompt
-                    retry_response = client.generate_content(
-                        simple_prompt,
-                        generation_config=config
+                    retry_response = client.chat.completions.create(
+                        model=self.model_name,
+                        messages=[
+                            {"role": "system", "content": "You are a Python expert."},
+                            {"role": "user", "content": simple_prompt}
+                        ],
+                        temperature=0.2,
+                        max_tokens=1000,
+                        top_p=0.8
                     )
                     
-                    if retry_response.candidates:
-                        retry_text = retry_response.candidates[0].content.parts[0].text
+                    if retry_response.choices[0].message.content:
+                        retry_text = retry_response.choices[0].message.content
                         sys.stderr.write(f"\n*** Retry response: {retry_text[:300]}... ***\n")
                         sys.stderr.flush()
                         
